@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PC 人臉辨識即時監控</title>
+<style>
+  :root { --bg:#0b1220; --card:#131c2e; --line:#26344d; --fg:#e5ecf7; --accent:#3b82f6; --ok:#4ade80; --err:#f87171; --warn:#fb923c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:"Noto Sans TC","Microsoft JhengHei",sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:6px 0 4px; }
+  .sub { opacity:.75; font-size:.9rem; margin-bottom:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .form { display:grid; grid-template-columns:2fr 1fr auto auto; gap:10px; align-items:end; }
+  label small { display:block; opacity:.75; margin-bottom:4px; font-size:.78rem; }
+  input { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0b1220; color:var(--fg); font-size:.95rem; }
+  button { padding:10px 16px; border:0; border-radius:8px; font-weight:700; font-size:.95rem; cursor:pointer; background:var(--accent); color:#fff; }
+  button.sec { background:#2a3750; }
+  button:disabled { opacity:.4; cursor:default; }
+  #state { margin-top:10px; font-size:.9rem; }
+  #state.ok { color:var(--ok); } #state.err { color:var(--err); }
+  .stats { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-bottom:12px; }
+  .stat { background:#0f1728; border:1px solid var(--line); border-radius:10px; padding:10px; text-align:center; }
+  .stat b { display:block; font-size:1.6rem; } .stat span { font-size:.75rem; opacity:.7; }
+  .main { display:grid; grid-template-columns:3fr 1fr; gap:12px; }
+  #cv { width:100%; height:auto; display:block; border-radius:10px; border:1px solid var(--line); background-color:#05080f;
+        background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px); background-size:10% 10%; }
+  ul.list { list-style:none; margin:8px 0 0; padding:0; font-size:.92rem; }
+  ul.list li { display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); gap:8px; }
+  #log { max-height:240px; overflow:auto; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+  .mono { font-family:Consolas,monospace; font-size:.8rem; opacity:.8; word-break:break-all; }
+  @media (max-width:800px) { .form { grid-template-columns:1fr 1fr; } .main { grid-template-columns:1fr; } .stats { grid-template-columns:repeat(2,1fr); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🖥️ PC 人臉辨識監控</h1>
+  <div class="sub">訂閱手機 face-api.js 的辨識結果，在黑色 Canvas 上重建人臉外框與姓名；不接收、不顯示照片。</div>
+
+  <div class="card">
+    <div class="form">
+      <label><small>MQTT Topic</small><input id="topic" value="nutc/im/1411331011/face"></label>
+      <label><small>裝置 ID 過濾（留空接收所有）</small><input id="dev" value="phone01"></label>
+      <button id="btnConn">▶ 連線訂閱</button>
+      <button id="btnDisc" class="sec" disabled>■ 中斷</button>
+    </div>
+    <div id="state">尚未連線</div>
+    <div class="mono" style="margin-top:8px">Broker：wss://broker.hivemq.com:8884/mqtt ｜ 公用 broker 任何人知道 Topic 都能看到內容，建議把 Topic 改成不易猜的字串（手機與 PC 要一致）。</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b id="sCur">0</b><span>目前人臉數</span></div>
+    <div class="stat"><b id="sKnown">0</b><span>已識別</span></div>
+    <div class="stat"><b id="sUnk">0</b><span>陌生人</span></div>
+    <div class="stat"><b id="sMsg">0</b><span>累計訊息</span></div>
+    <div class="stat"><b id="sAge">—</b><span>距最近訊息（秒）</span></div>
+  </div>
+
+  <div class="card main">
+    <div><canvas id="cv" width="640" height="480"></canvas></div>
+    <div>
+      <b>目前畫面中的人員</b>
+      <ul class="list" id="people"></ul>
+      <div class="mono" id="meta" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <b>出入紀錄</b>
+    <ul class="list" id="log"></ul>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+const LEAVE_MS = 3000;                          // 超過 3 秒沒再看到 → 視為離開
+let client = null, msgCount = 0, lastMsg = 0;
+const present = new Map();                      // 名稱 → 最後看到時間（"陌生人" 代表有未登錄的人）
+
+const hhmmss = () => new Date().toLocaleTimeString("zh-TW", { hour12: false });
+function setState(t, cls = "") { $("state").textContent = t; $("state").className = cls; }
+
+function addLog(name, entered) {
+  const li = document.createElement("li");
+  const l = document.createElement("span");
+  const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = entered ? "#4ade80" : "#94a3b8";
+  l.append(dot, document.createTextNode(`${hhmmss()}　${name}`));
+  const r = document.createElement("span"); r.className = "mono"; r.textContent = entered ? "出現" : "離開";
+  li.append(l, r);
+  $("log").prepend(li);
+  while ($("log").children.length > 100) $("log").lastChild.remove();
+}
+
+function connect() {
+  disconnect(true);
+  const topic = $("topic").value.trim();
+  if (!topic) { setState("請輸入 Topic", "err"); return; }
+  setState("正在連線…");
+  client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt", {
+    clientId: "face_pc_" + Math.random().toString(16).slice(2, 10),
+    clean: true, reconnectPeriod: 3000, connectTimeout: 8000
+  });
+  client.on("connect", () => {
+    client.subscribe(topic, { qos: 0 }, err => {
+      if (err) setState("❌ 訂閱失敗：" + err.message, "err");
+      else setState("✅ 已連線並訂閱：" + topic, "ok");
+    });
+    $("btnConn").disabled = true; $("btnDisc").disabled = false;
+  });
+  client.on("reconnect", () => setState("🔄 重新連線中…"));
+  client.on("error", e => setState("❌ 錯誤：" + e.message, "err"));
+  client.on("message", (t, buf) => {
+    let d; try { d = JSON.parse(buf.toString()); } catch { return; }
+    if (!d || typeof d !== "object") return;
+    const want = $("dev").value.trim();
+    if (want && d.deviceId !== want) return;
+    msgCount++; lastMsg = Date.now();
+    render(d);
+  });
+}
+
+function disconnect(quiet) {
+  if (client) { client.end(true); client = null; }
+  $("btnConn").disabled = false; $("btnDisc").disabled = true;
+  if (!quiet) setState("已中斷連線");
+}
+
+function render(d) {
+  // 訊息來自公用 broker，視為不可信：限制數量與型別，文字一律用 textContent / canvas 繪製
+  const W = Math.min(4096, Math.max(1, +d.width || 640)), H = Math.min(4096, Math.max(1, +d.height || 480));
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  ctx.clearRect(0, 0, W, H);
+  const fs = Math.max(14, Math.round(W / 34));
+  ctx.font = `bold ${fs}px "Noto Sans TC","Microsoft JhengHei",sans-serif`;
+  ctx.textBaseline = "top"; ctx.lineWidth = Math.max(2, W / 320);
+
+  const faces = (Array.isArray(d.faces) ? d.faces : []).slice(0, 30);
+  const now = Date.now();
+  let known = 0, unk = 0;
+  const ul = $("people"); ul.textContent = "";
+
+  for (const f of faces) {
+    if (!f || !Array.isArray(f.bbox) || f.bbox.length !== 4) continue;
+    const [x, y, w, h] = f.bbox.map(Number);
+    const isKnown = !!f.known;
+    const name = isKnown ? String(f.name || "?").slice(0, 20) : "陌生人";
+    const sim = Math.round((+f.similarity || 0) * 100);
+    const col = isKnown ? "#22c55e" : "#fb923c";
+    ctx.strokeStyle = col; ctx.strokeRect(x, y, w, h);
+    const text = isKnown ? `${name} ${sim}%` : "陌生人";
+    const tw = ctx.measureText(text).width + 10, th = fs + 8, ty = y - th >= 0 ? y - th : y;
+    ctx.fillStyle = col; ctx.fillRect(x, ty, tw, th);
+    ctx.fillStyle = "#000"; ctx.fillText(text, x + 5, ty + 4);
+
+    if (isKnown) known++; else unk++;
+    if (!present.has(name)) addLog(name, true);
+    present.set(name, now);
+
+    const li = document.createElement("li");
+    const left = document.createElement("span");
+    const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = col;
+    left.append(dot, document.createTextNode(name));
+    const right = document.createElement("span"); right.className = "mono";
+    right.textContent = isKnown ? `相似度 ${sim}%` : "—";
+    li.append(left, right); ul.appendChild(li);
+  }
+
+  $("sCur").textContent = faces.length;
+  $("sKnown").textContent = known;
+  $("sUnk").textContent = unk;
+  $("sMsg").textContent = msgCount;
+  $("meta").textContent = `裝置：${String(d.deviceId || "?").slice(0, 30)}　畫面：${W}×${H}`;
+}
+
+setInterval(() => {
+  $("sAge").textContent = lastMsg ? ((Date.now() - lastMsg) / 1000).toFixed(1) : "—";
+  const now = Date.now();
+  for (const [name, t] of present) if (now - t > LEAVE_MS) { present.delete(name); addLog(name, false); }
+}, 300);
+
+$("btnConn").onclick = connect;
+$("btnDisc").onclick = () => disconnect(false);
+</script>
+</body>
+</html>
