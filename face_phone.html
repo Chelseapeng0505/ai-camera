@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<title>手機人臉辨識 (face-api.js)</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --accent:#38bdf8; --danger:#f87171; --ok:#4ade80; --warn:#fb923c; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif; }
+  body { padding:max(12px,env(safe-area-inset-top)) 12px max(12px,env(safe-area-inset-bottom)); max-width:720px; margin:0 auto; }
+  h1 { font-size:1.15rem; margin:4px 0 10px; text-align:center; }
+  #status { text-align:center; font-size:.9rem; padding:8px; border-radius:10px; background:var(--card); margin-bottom:10px; }
+  #status.ok { color:var(--ok); } #status.err { color:var(--danger); }
+  #stage { position:relative; width:100%; background:#000; border-radius:14px; overflow:hidden; min-height:200px; }
+  #video { width:100%; display:block; }
+  #overlay { position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; }
+  .controls { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin:10px 0; }
+  button { font-size:1rem; padding:12px; border:0; border-radius:12px; background:var(--accent); color:#04263a; font-weight:700; }
+  button:disabled { opacity:.4; }
+  button.stop { background:var(--danger); color:#3b0a0a; }
+  button.sec { background:var(--card); color:var(--fg); border:1px solid #334155; }
+  button.small { padding:6px 10px; font-size:.82rem; border-radius:8px; }
+  .panel { background:var(--card); border-radius:12px; padding:12px; margin-bottom:10px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  input[type=range] { width:100%; margin-top:6px; accent-color:var(--accent); }
+  input[type=text] { width:100%; background:#0f172a; color:var(--fg); border:1px solid #334155; border-radius:8px; padding:8px; font-size:.95rem; margin-top:4px; }
+  small { opacity:.7; }
+  .stats { display:flex; gap:14px; font-size:.9rem; flex-wrap:wrap; }
+  ul.list { margin:8px 0 0; padding:0; list-style:none; font-size:.92rem; max-height:190px; overflow:auto; }
+  ul.list li { display:flex; justify-content:space-between; align-items:center; padding:5px 0; border-bottom:1px solid #334155; gap:8px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+  .enroll { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:end; margin-top:6px; }
+</style>
+</head>
+<body>
+  <h1>🙂 手機人臉辨識 (face-api.js)</h1>
+  <div id="status">⏳ 正在載入人臉模型…</div>
+
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="btnStart" disabled>▶ 啟動</button>
+    <button id="btnStop" class="stop" disabled>■ 停止</button>
+    <button id="btnSwitch" class="sec" disabled>🔄 切換前/後鏡頭</button>
+    <label class="row sec" style="background:var(--card);border:1px solid #334155;border-radius:12px;padding:0 12px"><span>顯示特徵點</span><input type="checkbox" id="showLm"></label>
+  </div>
+
+  <div class="panel">
+    <div class="stats">
+      <span>人臉數：<b id="cnt">0</b></span>
+      <span>已識別：<b id="knownCnt">0</b></span>
+      <span>FPS：<b id="fps">0</b></span>
+    </div>
+    <ul class="list" id="faceList"></ul>
+  </div>
+
+  <div class="panel">
+    <div class="row"><span>偵測信心：<b id="thVal">50</b>%</span></div>
+    <input type="range" id="th" min="20" max="95" step="5" value="50">
+    <div class="row" style="margin-top:10px"><span>比對門檻（距離）：<b id="mtVal">0.50</b></span><small>越小越嚴格</small></div>
+    <input type="range" id="mt" min="30" max="70" step="1" value="50">
+  </div>
+
+  <div class="panel">
+    <b>👤 人臉登錄</b>
+    <div class="enroll">
+      <label><small>姓名</small><input type="text" id="enrollName" maxlength="20" placeholder="例如：王小明"></label>
+      <button id="btnEnroll">📸 登錄</button>
+    </div>
+    <small>先啟動相機，讓畫面中只有要登錄的那張臉，輸入姓名後按「登錄」。同一人建議從不同角度登錄 3 張。</small>
+    <ul class="list" id="dbList"></ul>
+    <div class="row" style="margin-top:8px"><small>人臉特徵只存在這支手機的瀏覽器，不會上傳。</small><button class="sec small" id="btnClear">清除全部</button></div>
+  </div>
+
+  <div class="panel">
+    <div class="row"><b>📡 MQTT 發布</b><span id="mqttState">未連線</span></div>
+    <label><small>Topic</small><input type="text" id="topic" value="nutc/im/1411331011/face"></label>
+    <label><small>裝置 ID</small><input type="text" id="devId" value="phone01"></label>
+    <div class="row" style="margin-top:8px">
+      <label><input type="checkbox" id="pubOn" checked> 即時發布辨識結果</label>
+      <small>已發布 <b id="pubCnt">0</b> 則</small>
+    </div>
+    <small>只傳姓名、相似度、信心分數與外框座標，不傳照片，也不傳人臉特徵。Broker：broker.hivemq.com</small>
+  </div>
+  <small>提示：攝影機需 HTTPS。人臉模型在瀏覽器本機執行，影像不會上傳。</small>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model/";
+const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+const DB_KEY = "face_db_v1";
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+
+let ready = false, stream = null, running = false, busy = false, facing = "user";
+let minScore = 0.5, matchTh = 0.5, frames = 0, lastT = performance.now();
+let db = [];            // [{ name, samples: [[128 個數字], ...] }]
+let lastRes = [];       // 最近一幀的偵測結果（登錄時使用）
+let client = null, pubCount = 0, lastPub = 0;
+
+function setStatus(m, c = "") { $("status").textContent = m; $("status").className = c; }
+
+/* ---------- 人臉資料庫（localStorage） ---------- */
+function loadDB() { try { db = JSON.parse(localStorage.getItem(DB_KEY) || "[]"); } catch { db = []; } if (!Array.isArray(db)) db = []; }
+function saveDB() { try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { setStatus("⚠ 無法儲存人臉資料（瀏覽器限制）", "err"); } }
+function renderDB() {
+  const ul = $("dbList"); ul.textContent = "";
+  if (!db.length) { const li = document.createElement("li"); li.textContent = "尚未登錄任何人臉"; ul.appendChild(li); return; }
+  db.forEach((p, i) => {
+    const li = document.createElement("li");
+    const span = document.createElement("span"); span.textContent = `${p.name}（${p.samples.length} 張樣本）`;
+    const b = document.createElement("button"); b.textContent = "刪除"; b.className = "sec small";
+    b.onclick = () => { if (confirm(`刪除「${p.name}」的人臉資料？`)) { db.splice(i, 1); saveDB(); renderDB(); } };
+    li.append(span, b); ul.appendChild(li);
+  });
+}
+
+/* ---------- 比對 ---------- */
+function dist(a, b) { let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
+function matchFace(desc) {
+  let bestName = null, best = Infinity;
+  for (const p of db) for (const s of p.samples) { const d = dist(desc, s); if (d < best) { best = d; bestName = p.name; } }
+  if (bestName === null) return { name: "未知", known: false, distance: null, similarity: 0 };
+  const known = best <= matchTh;
+  return { name: known ? bestName : "未知", known, distance: +best.toFixed(3), similarity: +Math.max(0, Math.min(1, 1 - best)).toFixed(3) };
+}
+
+/* ---------- 模型與相機 ---------- */
+async function loadModels() {
+  try {
+    await faceapi.tf.ready();
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+      faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+    ]);
+    ready = true;
+    setStatus("✅ 模型已就緒，按「啟動」開始辨識", "ok");
+    $("btnStart").disabled = running;
+  } catch (e) { console.error(e); setStatus("❌ 人臉模型載入失敗，請檢查網路後重新整理", "err"); }
+}
+
+async function startCamera() {
+  stopCamera(true);
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("❌ 此瀏覽器不支援相機，或網址不是 HTTPS", "err"); return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, video: { facingMode: { ideal: facing }, width: { ideal: 960 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream; await video.play();
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    running = true;
+    $("btnStart").disabled = true; $("btnStop").disabled = false; $("btnSwitch").disabled = false;
+    setStatus("🔍 辨識中…", "ok");
+    loop();
+  } catch (e) {
+    console.error(e);
+    setStatus("❌ 無法開啟相機：" + (e.name === "NotAllowedError" ? "請允許相機權限" : e.message), "err");
+  }
+}
+
+function stopCamera(silent) {
+  const was = running;
+  running = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.srcObject = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $("btnStart").disabled = !ready; $("btnStop").disabled = true; $("btnSwitch").disabled = true;
+  $("cnt").textContent = "0"; $("knownCnt").textContent = "0"; $("fps").textContent = "0"; $("faceList").textContent = "";
+  lastRes = [];
+  if (was) publishFaces([], canvas.width, canvas.height, true);   // 通知 PC 清空
+  if (!silent) setStatus("⏹ 已停止", "");
+}
+
+/* ---------- 辨識迴圈 ---------- */
+async function loop() {
+  if (!running) return;
+  if (!busy && video.readyState >= 2) {
+    busy = true;
+    try {
+      if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
+      const res = await faceapi
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: minScore }))
+        .withFaceLandmarks().withFaceDescriptors();
+      if (running) {
+        lastRes = res;
+        const items = res.map(r => {
+          const m = matchFace(r.descriptor), b = r.detection.box;
+          return { ...m, score: +r.detection.score.toFixed(3), bbox: [b.x, b.y, b.width, b.height].map(Math.round), pts: r.landmarks.positions };
+        });
+        draw(items, canvas.width, canvas.height);
+        updateInfo(items);
+        publishFaces(items, canvas.width, canvas.height);
+        frames++;
+        const now = performance.now();
+        if (now - lastT >= 1000) { $("fps").textContent = frames; frames = 0; lastT = now; }
+      }
+    } catch (e) { console.error(e); }
+    busy = false;
+  }
+  requestAnimationFrame(loop);
+}
+
+function draw(items, W, H) {
+  ctx.clearRect(0, 0, W, H);
+  const fs = Math.max(14, Math.round(W / 34));
+  ctx.font = `bold ${fs}px "Noto Sans TC","Microsoft JhengHei",sans-serif`;
+  ctx.textBaseline = "top"; ctx.lineWidth = Math.max(2, W / 320);
+  const showLm = $("showLm").checked;
+  for (const it of items) {
+    const [x, y, w, h] = it.bbox, col = it.known ? "#22c55e" : "#fb923c";
+    ctx.strokeStyle = col; ctx.strokeRect(x, y, w, h);
+    if (showLm) { ctx.fillStyle = col; for (const p of it.pts) ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3); }
+    const text = it.known ? `${it.name} ${Math.round(it.similarity * 100)}%` : "未知";
+    const tw = ctx.measureText(text).width + 10, th = fs + 8, ty = y - th >= 0 ? y - th : y;
+    ctx.fillStyle = col; ctx.fillRect(x, ty, tw, th);
+    ctx.fillStyle = "#000"; ctx.fillText(text, x + 5, ty + 4);
+  }
+}
+
+function updateInfo(items) {
+  $("cnt").textContent = items.length;
+  $("knownCnt").textContent = items.filter(i => i.known).length;
+  const ul = $("faceList"); ul.textContent = "";
+  items.forEach(it => {
+    const li = document.createElement("li");
+    const left = document.createElement("span");
+    const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = it.known ? "#22c55e" : "#fb923c";
+    left.append(dot, document.createTextNode(it.known ? it.name : "未知"));
+    const right = document.createElement("small");
+    right.textContent = it.distance === null ? "—" : `相似度 ${Math.round(it.similarity * 100)}% · 距離 ${it.distance}`;
+    li.append(left, right); ul.appendChild(li);
+  });
+}
+
+/* ---------- 登錄 ---------- */
+function enroll() {
+  const name = $("enrollName").value.trim().slice(0, 20);
+  if (!name) { setStatus("請先輸入姓名", "err"); return; }
+  if (!running || !lastRes.length) { setStatus("畫面中沒有偵測到人臉，請先啟動相機並對準臉", "err"); return; }
+  const area = r => r.detection.box.width * r.detection.box.height;
+  const r = lastRes.reduce((a, b) => area(b) > area(a) ? b : a);       // 取最大的一張臉
+  let p = db.find(x => x.name === name);
+  if (!p) { p = { name, samples: [] }; db.push(p); }
+  p.samples.push(Array.from(r.descriptor, v => +v.toFixed(4)));
+  if (p.samples.length > 10) p.samples.shift();
+  saveDB(); renderDB();
+  setStatus(`✅ 已登錄「${name}」（${p.samples.length} 張樣本）`, "ok");
+}
+
+/* ---------- MQTT ---------- */
+function mqttConnect() {
+  if (typeof mqtt === "undefined") { $("mqttState").textContent = "❌ MQTT.js 載入失敗"; return; }
+  client = mqtt.connect(BROKER_URL, {
+    clientId: "face_phone_" + Math.random().toString(16).slice(2, 10),
+    clean: true, reconnectPeriod: 3000, connectTimeout: 8000
+  });
+  client.on("connect",   () => $("mqttState").textContent = "✅ 已連線");
+  client.on("reconnect", () => $("mqttState").textContent = "🔄 重新連線中…");
+  client.on("close",     () => $("mqttState").textContent = "❌ 已離線");
+  client.on("error",     e  => { console.error(e); $("mqttState").textContent = "❌ 錯誤"; });
+}
+
+function publishFaces(items, W, H, force = false) {
+  if (!client || !client.connected || !$("pubOn").checked) return;
+  const now = Date.now();
+  if (!force && now - lastPub < 250) return;                       // 最多每秒 4 則
+  lastPub = now;
+  const payload = {
+    deviceId: $("devId").value.trim() || "phone01",
+    ts: now, width: W, height: H,
+    total: items.length,
+    known: items.filter(i => i.known).length,
+    faces: items.map(i => ({ name: i.name, known: i.known, similarity: i.similarity, distance: i.distance, score: i.score, bbox: i.bbox }))
+  };
+  client.publish($("topic").value.trim(), JSON.stringify(payload), { qos: 0 });
+  pubCount++; $("pubCnt").textContent = pubCount;
+}
+
+/* ---------- 事件 ---------- */
+$("btnStart").onclick = startCamera;
+$("btnStop").onclick = () => stopCamera();
+$("btnSwitch").onclick = () => { facing = facing === "user" ? "environment" : "user"; startCamera(); };
+$("btnEnroll").onclick = enroll;
+$("btnClear").onclick = () => { if (db.length && confirm("確定清除所有已登錄的人臉？")) { db = []; saveDB(); renderDB(); } };
+$("th").oninput = e => { minScore = e.target.value / 100; $("thVal").textContent = e.target.value; };
+$("mt").oninput = e => { matchTh = e.target.value / 100; $("mtVal").textContent = matchTh.toFixed(2); };
+document.addEventListener("visibilitychange", () => { if (document.hidden && running) stopCamera(); });
+
+loadDB(); renderDB();
+mqttConnect();
+loadModels();
+</script>
+</body>
+</html>
